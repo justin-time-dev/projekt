@@ -1,7 +1,12 @@
 ---
 stepsCompleted: ['step-01-init', 'step-02-discovery', 'step-02b-vision', 'step-02c-executive-summary', 'step-03-success', 'step-04-journeys', 'step-05-domain', 'step-06-innovation', 'step-07-project-type', 'step-08-scoping', 'step-09-functional', 'step-10-nonfunctional', 'step-11-polish', 'step-12-complete']
 completedAt: '2026-03-21'
-inputDocuments: []
+lastEdited: '2026-03-22'
+editHistory:
+  - date: '2026-03-22'
+    changes: 'Aligned with architecture: backfilled FR28-FR39 (home config, project creation, repo management, projekts backing repo, diagnostics); updated CLI Tool section (command set 3→11, removed Uber fx/DI container references, added home config schema, updated project config schema with repos array); added measurement conditions to NFR1-3'
+inputDocuments:
+  - '_bmad-output/planning-artifacts/architecture.md'
 workflowType: 'prd'
 briefCount: 0
 researchCount: 0
@@ -54,7 +59,7 @@ Personal tool — success is sustained daily use by the author. Secondary signal
 
 - Bootstrap a new project context: under 60 seconds from zero
 - Collaborator productive on a shared project: one command, no documentation required
-- Maintenance burden: near-zero — `projekt` must not require regular upkeep to remain functional
+- Maintenance burden: after initial release, all of the following hold for 90 days without code changes — `govulncheck ./...` is clean, `make test && make lint` passes on the current Go stable release, and integration tests pass against current released versions of `mise` and `mani`; if any condition requires a patch within 90 days, the maintenance goal has failed
 
 ## User Journeys
 
@@ -74,11 +79,13 @@ With `projekt`, he `cd`s into his `internal-platform` project directory. Context
 
 A contractor joins Justin's client project mid-sprint. Normally Justin would spend 30 minutes walking them through repo structure, toolchain setup, and branch conventions — half of which would be forgotten by the next day.
 
-Instead, Justin says: "Run `projekt init` in the client-project directory." The contractor pulls the project definition from the backing git repo, bootstraps the worktrees, activates mani and mise, and has a working environment — same structure Justin sees — in under a minute.
+**Moment 1 — First-time setup (once per machine):** Justin sends the contractor two things: the projekts backing repo URL and a pointer to the install docs. The contractor installs `projekt` (via Homebrew or mise), installs the declared plugins (`mise`, `mani`), and runs `projekt projekts init <url>` to connect their machine to the shared project registry. This is a one-time cost, not specific to any project.
 
-**Resolution:** The contractor ships their first PR the same day. Justin never wrote a setup doc.
+**Moment 2 — Joining a project (repeatable, near-zero friction):** Justin says "the project is called `client-project`." The contractor runs `projekt list` to confirm it's there, `cd`s into a fresh directory, and runs `projekt init`. Worktrees are created, the repo structure matches Justin's exactly, and mise activates the right toolchain on `cd`. No verbal walkthrough, no setup doc.
 
-**Capabilities revealed:** project init from backing repo, reproducible environment bootstrap, plugin-driven setup
+**Resolution:** The contractor ships their first PR the same day. Justin never wrote a setup doc. The one-time machine setup is a real cost — but it's paid once, not per project.
+
+**Capabilities revealed:** project init from backing repo, reproducible environment bootstrap, plugin-driven setup, projekts backing repo as shared registry
 
 ---
 
@@ -120,6 +127,10 @@ Onboarding: clone the projekts repo, `cd` into the project directory, run `proje
 ### Plugin Architecture
 
 Plugins are declared dependencies in the project config (`plugins: [mani, mise, git-worktree]`). They are independent tools that read `projekt` context — not orchestrated by `projekt`. Each plugin conforms to a `pluginType` contract. `projekt` does not call plugins directly; plugins hook into their own lifecycle (shell init, direnv hooks, etc.).
+
+**Core plugins** (`mise`, `mani`, `git-worktree`) hold a privileged architectural position: they are implemented as plugins and conform to the same `pluginType` contracts available to third parties, but they ship alongside `projekt` via goreleaser, are distributed as part of the standard install, and are expected to be present for core workflows. `mise` in particular is architecturally load-bearing — it owns context activation (exporting `PROJEKT_*` vars on `cd`) and is the mechanism that makes `projekt context` "fully resolved" at runtime. `mani` is the canonical multi-repo coordination layer. These are not optional integrations; they are the reference implementation of what `projekt` is designed to compose with.
+
+**Third-party plugins** conform to the same `pluginType` contracts but are not distributed with `projekt`. They are validated only by binary presence (`exec.LookPath`) and receive an `PluginTypeUnknown` warning if their name is not in the first-party registry.
 
 ## Innovation & Novel Patterns
 
@@ -163,21 +174,33 @@ Today, onboarding hands off code and documentation. `projekt` hands off a comple
 ### Technical Stack
 
 - **Language:** Go
-- **Dependency Injection:** Uber fx — resolves output formatters, plugin integrations, and core services
+- **CLI Framework:** Cobra — command dispatch and flag binding
+- **Wiring:** Manual in `main.go` — no DI container
 - **Distribution:** single binary, installable via Homebrew, mise, direct download
 
 ### Command Structure
 
 ```
-projekt init          # bootstrap project context from .projekt in current directory
-projekt context       # show current resolved context (name, plugins, backing repo)
-projekt list          # list projects in the current backing repo
+projekt home                  # show home config (repos_dir, projects_dir)
+projekt context               # show resolved project context (name, plugins, backing repo)
+projekt list                  # list projects in backing repo
+projekt create <name>         # scaffold new project in projects_dir; --plugins flag declares and validates plugins at creation time
+projekt init                  # bootstrap existing project from .projekt in CWD
+projekt doctor                # diagnose environment issues and guide fixes
+projekt repo add <url|name>   # clone repo to repos_dir + worktree in project
+projekt repo list             # list repos in current project
+projekt projekts init <url>   # initialize/connect projekts backing repo
+projekt projekts push         # push project configs to backing repo
+projekt projekts pull         # pull latest project configs from backing repo
 ```
 
 ### Config Schema
 
 ```yaml
 name: client-project
+repos:
+  - name: foo
+    url: git@github.com:org/foo.git
 plugins:
   - git-worktree
   - mani
@@ -185,15 +208,27 @@ plugins:
 backing_repo: git@github.com:appfolio/projekts_jmaher.git
 ```
 
+### Home Config Schema
+
+```yaml
+# ~/.config/projekt/config.yaml
+repos_dir: ~/src/repos                           # PROJEKT_REPOS_DIR
+projects_dir: ~/src/projects                     # PROJEKT_PROJECTS_DIR
+projekts_repo: git@github.com:you/projekts.git  # optional default
+projekts_local_dir: ~/.local/share/projekt/projekts  # PROJEKT_PROJEKTS_LOCAL
+```
+
+Home config is optional — defaults apply if missing. All fields overrideable via env vars.
+
 ### Output Formats
 
-Formatters are registered as fx-injectable dependencies. Selected via `--output` flag.
+Formatters wired manually at command construction. Selected via `--output` flag.
 
 | Format | Flag | Status |
 |---|---|---|
 | Human-readable | `--output text` | MVP |
 | JSON | `--output json` | MVP |
-| Others (YAML, table, etc.) | `--output <type>` | Growth — register via DI |
+| Others (YAML, table, etc.) | `--output <type>` | Growth |
 
 ### Scripting & 12-Factor Config
 
@@ -202,12 +237,6 @@ Formatters are registered as fx-injectable dependencies. Selected via `--output`
 - No interactive prompts when stdout is not a TTY
 - All configuration via files and environment variables
 
-### fx Module Boundaries
-
-- **core** — context resolution, config parsing
-- **formatters** — output rendering (human, JSON, extensible)
-- **plugins** — future plugin registry integration
-
 ## Product Scope
 
 ### Phase 1 — MVP
@@ -215,12 +244,13 @@ Formatters are registered as fx-injectable dependencies. Selected via `--output`
 **Journeys covered:** Journey 1 (context switching), Journey 2 (collaborator onboarding), Journey 3 (plugin author — partially: contract defined, first-party plugins as reference)
 
 - `projekt init`, `projekt context`, `projekt list`
+- `projekt projekts init` — required MVP prerequisite for `projekt list` and collaborator onboarding; without it `projekt list` exits with "no projekts repo configured"
+- `projekt projekts push`, `projekt projekts pull`
 - Context resolution: CWD traversal + `$PROJEKT_CONTEXT`
 - `.projekt` config schema
 - Typed plugin architecture (`pluginType`)
-- First-party plugins: `git-worktree`, `mani`, `mise`
-- Backing repo support
-- Output formatters: human-readable + JSON via fx DI
+- Core plugins: `git-worktree`, `mani`, `mise`
+- Output formatters: human-readable + JSON (manually wired)
 - Single binary distribution
 
 **Highest-stakes decision:** Plugin contract design. Mitigated by: author has prior plugin architecture experience; `pluginType` scopes each contract narrowly; first-party plugins validate contracts before publication.
@@ -246,7 +276,7 @@ Formatters are registered as fx-injectable dependencies. Selected via `--output`
 
 - **FR1:** User can have project context automatically resolved by traversing up from CWD to find a `.projekt` config file
 - **FR2:** User can override context resolution via `$PROJEKT_CONTEXT` environment variable
-- **FR3:** User can view the fully resolved current project context (name, plugins, backing repo)
+- **FR3:** User can view the fully resolved current project context (name, plugins, backing repo) — "fully resolved" assumes the `mise` core plugin is active and `PROJEKT_*` vars are exported; without it, `projekt context` shows the configured context from `.projekt` only
 - **FR4:** System operates statelessly — no daemon, no global registry, no persistent process
 
 ### Project Lifecycle
@@ -266,16 +296,18 @@ Formatters are registered as fx-injectable dependencies. Selected via `--output`
 
 - **FR12:** User can declare plugin dependencies in the project config by name
 - **FR13:** Plugins are typed by `pluginType` — each type defines a distinct capability contract
-- **FR14:** Plugin authors can implement a plugin conforming to a `pluginType` contract
-- **FR15:** Plugin authors can reference first-party plugins as canonical implementation examples
-- **FR16:** Plugins can read the resolved project context to perform their operations
+- **FR14:** Third-party plugin authors can implement a plugin conforming to a `pluginType` contract
+- **FR15:** Third-party plugin authors can reference core plugins as canonical implementation examples
+- **FR16:** Plugins can read the resolved project context via `PROJEKT_*` environment variables
 - **FR17:** Plugins operate independently — not orchestrated by `projekt` core
 
-### First-Party Plugins
+### Core Plugins
 
-- **FR18:** User can manage git worktrees scoped to a project (via `git-worktree` plugin, `pluginType: worktree`)
-- **FR19:** User can run multi-repo operations scoped to the current project (via `mani` plugin, `pluginType: multi-repo`)
-- **FR20:** User can activate a project-scoped toolchain and environment (via `mise` plugin, `pluginType: toolchain`)
+Core plugins ship alongside `projekt` and are expected to be present for core workflows. They conform to the same `pluginType` contracts as third-party plugins.
+
+- **FR18:** When `mise` is active and exporting `PROJEKT_*` environment variables, the user can manage git worktrees scoped to the current project via the `git-worktree` core plugin (`pluginType: worktree`)
+- **FR19:** When `mise` is active and exporting `PROJEKT_*` environment variables, the user can run multi-repo operations scoped to the current project via the `mani` core plugin (`pluginType: multi-repo`)
+- **FR20:** The `mise` core plugin (`pluginType: toolchain`) activates project context on `cd` by reading `.projekt` and exporting `PROJEKT_*` environment variables — this is the mechanism that makes `projekt context` fully resolved at runtime and is the activation path all other plugins depend on
 
 ### Output & Scripting
 
@@ -287,18 +319,45 @@ Formatters are registered as fx-injectable dependencies. Selected via `--output`
 - **FR26:** User can install `projekt` as a single self-contained binary
 - **FR27:** User can override any CLI flag via a corresponding environment variable (12-factor config pattern)
 
+### Home Configuration
+
+- **FR28:** User can set a global default repos directory via `~/.config/projekt/config.yaml` (`repos_dir`, default `~/src/repos`)
+- **FR29:** User can set a global default projects directory via `~/.config/projekt/config.yaml` (`projects_dir`, default `~/src/projects`)
+- **FR30:** User can override the global repos directory at runtime via `PROJEKT_REPOS_DIR` environment variable
+- **FR31:** User can override the global projects directory at runtime via `PROJEKT_PROJECTS_DIR` environment variable
+- **FR40:** User can configure the local clone location for the projekts backing repo via `~/.config/projekt/config.yaml` (`projekts_local_dir`, default `~/.local/share/projekt/projekts`)
+- **FR41:** User can override the projekts local clone directory at runtime via `PROJEKT_PROJEKTS_LOCAL` environment variable
+
+### Project Creation & Repo Management
+
+- **FR32:** User can scaffold a new project directory in projects_dir via `projekt create <name> [--plugins <comma-separated list>]`; if `--plugins` is provided, plugins are written to the scaffolded `.projekt` and validated immediately with warnings for any not found in PATH
+- **FR33:** User can add a repository to the current project, cloning it to repos_dir and creating a worktree in the project directory, via `projekt repo add <url|name>`
+- **FR34:** User can list all repositories in the current project via `projekt repo list`
+
+### Projekts Backing Repository Management
+
+- **FR35:** User can initialize or connect a projekts backing repository via `projekt projekts init <url>`
+- **FR36:** User can view the resolved home configuration (repos_dir, projects_dir) via `projekt home`
+- **FR37:** User can push project configurations to the backing repository via `projekt projekts push`
+- **FR38:** User can pull project configurations from the backing repository via `projekt projekts pull`
+
+### Diagnostics
+
+- **FR39:** User can diagnose environment configuration issues (missing plugins, misconfigured backing repo, malformed `.projekt`) and receive guided remediation steps via `projekt doctor`
+
 ## Non-Functional Requirements
 
 ### Performance
 
-- **NFR1:** Binary startup time must not exceed 100ms on a modern laptop
-- **NFR2:** Context resolution (directory traversal + config parsing) must complete in under 50ms
-- **NFR3:** `projekt init` must complete within 60 seconds on a standard internet connection, excluding git clone time for large repos
+- **NFR1:** Binary startup time must not exceed 100ms on Apple Silicon M-series hardware, measured via `hyperfine --warmup 3 'projekt --help'`
+- **NFR2:** Context resolution (directory traversal + config parsing) must complete in under 50ms on Apple Silicon M-series hardware, measured via benchmark test with a 5-level deep directory tree
+- **NFR3a:** `projekt init` internal overhead (plugin validation + worktree creation, excluding all git clone time) must complete in under 5 seconds, measured by a benchmark test using a pre-cloned bare repo
+- **NFR3b:** End-to-end `projekt init` against a reference project (repos totaling under 50 MB) must complete in under 60 seconds on a 100 Mbps connection, measured via `hyperfine` against a controlled test fixture
 
 ### Security
 
 - **NFR4:** `projekt` must not store credentials — authentication delegated entirely to git tooling (SSH keys, git credential helpers)
-- **NFR5:** Project config files must not contain secrets — sensitive values injected via environment variables
+- **NFR5:** Project config files are not the right place for secrets — `projekt` does not enforce secret detection, but by convention sensitive values (tokens, credentials) must never be placed in `.projekt` files; they must be injected via environment variables. Documentation must state this explicitly.
 - **NFR6:** Plugins execute with the invoking user's permissions — `projekt` must not escalate privileges
 
 ### Integration
@@ -309,7 +368,7 @@ Formatters are registered as fx-injectable dependencies. Selected via `--output`
 
 ### Reliability
 
-- **NFR10:** Must never modify or corrupt git repository state — worktree operations must be atomic or reversible
+- **NFR10:** Worktree operations must never leave git repository state corrupted or inconsistent — all operations must be fully applied or fully rolled back; no partial state
 - **NFR11:** A failed `projekt init` must leave the filesystem in its pre-command state
 - **NFR12:** Must degrade gracefully when a declared plugin is not installed — clear error, no silent failure
 
